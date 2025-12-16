@@ -1,5 +1,6 @@
-import React, { useState, useEffect } from 'react';
-import { RecordedSession, ResourceUser } from '../types';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
+import { RecordedSession, ResourceUser, SessionLog } from '../types';
+import { getVideoFromDB, getLogsFromDB } from '../services/db';
 
 interface VaultProps {
   sessions: RecordedSession[];
@@ -8,6 +9,17 @@ interface VaultProps {
   onCreateUser?: (newUser: ResourceUser) => void;
   users?: ResourceUser[];
   onUpdateUser?: (updatedUser: ResourceUser) => void;
+  onExportUsers?: () => void;
+  onImportUsers?: (file: File) => void;
+}
+
+interface ActivitySegment {
+  startTime: number;
+  endTime: number;
+  duration: number;
+  category: string;
+  screenshot?: string;
+  count: number;
 }
 
 export const Vault: React.FC<VaultProps> = ({ 
@@ -16,17 +28,26 @@ export const Vault: React.FC<VaultProps> = ({
   onDelete, 
   onCreateUser,
   users = [],
-  onUpdateUser
+  onUpdateUser,
+  onExportUsers,
+  onImportUsers
 }) => {
   const [now, setNow] = useState(Date.now());
   const [selectedSession, setSelectedSession] = useState<RecordedSession | null>(null);
   const [decryptionStatus, setDecryptionStatus] = useState<'locked' | 'decrypting' | 'unlocked'>('locked');
+  const [videoLoading, setVideoLoading] = useState(false);
   
-  // View State for Admin
-  const [viewMode, setViewMode] = useState<'sessions' | 'users'>('sessions');
+  // View State
+  const [viewMode, setViewMode] = useState<'sessions' | 'users' | 'analytics'>('sessions');
 
   // Search State
   const [searchQuery, setSearchQuery] = useState('');
+
+  // Analytics State
+  const [selectedAnalyticsUser, setSelectedAnalyticsUser] = useState<string>('all');
+  const [analysisSessionId, setAnalysisSessionId] = useState<string | null>(null);
+  const [detailedAnalysis, setDetailedAnalysis] = useState<{session: RecordedSession, segments: ActivitySegment[]} | null>(null);
+  const [isLoadingAnalysis, setIsLoadingAnalysis] = useState(false);
 
   // Create/Edit User Modal State
   const [showUserModal, setShowUserModal] = useState(false);
@@ -36,11 +57,112 @@ export const Vault: React.FC<VaultProps> = ({
   const [userFormPassword, setUserFormPassword] = useState('');
   const [formSuccess, setFormSuccess] = useState(false);
 
-  // Update "now" every minute to update remaining time and filter out expired sessions
+  const importInputRef = useRef<HTMLInputElement>(null);
+
+  // Update "now" every minute
   useEffect(() => {
     const interval = setInterval(() => setNow(Date.now()), 60000);
     return () => clearInterval(interval);
   }, []);
+
+  // Async Effect to Load Detailed Analysis Data
+  useEffect(() => {
+    if (!analysisSessionId) {
+        setDetailedAnalysis(null);
+        return;
+    }
+
+    const loadData = async () => {
+        setIsLoadingAnalysis(true);
+        try {
+            const session = sessions.find(s => s.id === analysisSessionId);
+            if (!session) {
+                setDetailedAnalysis(null);
+                return;
+            }
+
+            // Try to get full logs with thumbnails from DB to restore visual context
+            const dbLogs = await getLogsFromDB(session.id);
+            const logsToUse = (dbLogs && dbLogs.length > 0) ? dbLogs : session.logs;
+
+            if (!logsToUse || logsToUse.length === 0) {
+                setDetailedAnalysis({ session, segments: [] });
+                return;
+            }
+
+            // Group consecutive logs into segments
+            const segments: ActivitySegment[] = [];
+            let currentSegment: ActivitySegment | null = null;
+
+            // Sort logs by time
+            const sortedLogs = [...logsToUse].sort((a,b) => a.timestamp - b.timestamp);
+
+            sortedLogs.forEach((log) => {
+                const logDuration = log.category === 'Idle' ? 60 : 15;
+                
+                if (!currentSegment) {
+                    currentSegment = {
+                        startTime: log.timestamp,
+                        endTime: log.timestamp + logDuration * 1000,
+                        duration: logDuration,
+                        category: log.category,
+                        screenshot: log.thumbnail, // First thumbnail
+                        count: 1
+                    };
+                } else {
+                    // Check continuity (within 2 mins) and same category
+                    const timeGap = log.timestamp - currentSegment.endTime;
+                    if (timeGap < 120000 && log.category === currentSegment.category) {
+                        currentSegment.endTime = log.timestamp + logDuration * 1000;
+                        currentSegment.duration += logDuration;
+                        currentSegment.count += 1;
+                        // Prioritize preserving a valid screenshot if we have one
+                        if (!currentSegment.screenshot && log.thumbnail) {
+                            currentSegment.screenshot = log.thumbnail;
+                        }
+                    } else {
+                        segments.push(currentSegment);
+                        currentSegment = {
+                            startTime: log.timestamp,
+                            endTime: log.timestamp + logDuration * 1000,
+                            duration: logDuration,
+                            category: log.category,
+                            screenshot: log.thumbnail,
+                            count: 1
+                        };
+                    }
+                }
+            });
+            if (currentSegment) segments.push(currentSegment);
+
+            setDetailedAnalysis({ session, segments });
+        } catch (e) {
+            console.error("Failed to analyze session", e);
+        } finally {
+            setIsLoadingAnalysis(false);
+        }
+    };
+
+    loadData();
+  }, [analysisSessionId, sessions]);
+
+  // Effect to load video when session is selected and no videoUrl is present
+  useEffect(() => {
+    if (selectedSession && !selectedSession.videoUrl) {
+      setVideoLoading(true);
+      getVideoFromDB(selectedSession.id)
+        .then((blob) => {
+          if (blob) {
+            const url = URL.createObjectURL(blob);
+            setSelectedSession((prev) => prev ? { ...prev, videoUrl: url } : null);
+          }
+        })
+        .catch((e) => console.error("Video fetch failed", e))
+        .finally(() => setVideoLoading(false));
+    } else {
+      setVideoLoading(false);
+    }
+  }, [selectedSession?.id]); // Only re-run if ID changes
 
   const getRemainingTime = (expiry: number) => {
     const diff = expiry - now;
@@ -50,39 +172,89 @@ export const Vault: React.FC<VaultProps> = ({
     return `${hours}h ${minutes}m`;
   };
 
-  const handleOpenCreateUser = () => {
-      setIsEditingUser(false);
-      setEditingUserId(null);
-      setUserFormUsername('');
-      setUserFormPassword('');
-      setShowUserModal(true);
+  const formatDuration = (seconds: number) => {
+      const h = Math.floor(seconds / 3600);
+      const m = Math.floor((seconds % 3600) / 60);
+      return `${h}h ${m}m`;
   };
 
-  const handleOpenEditUser = (user: ResourceUser) => {
-      setIsEditingUser(true);
-      setEditingUserId(user.id);
-      setUserFormUsername(user.username);
-      setUserFormPassword(user.password);
-      setShowUserModal(true);
+  const getPercentage = (part: number, total: number) => {
+      if (total === 0) return 0;
+      return Math.round((part / total) * 100);
   };
 
+  const activeSessions = sessions.filter(s => {
+      const isVisibleForRole = role === 'admin' ? true : (s.status !== 'expired' && s.expiryTime > now);
+      if (!isVisibleForRole) return false;
+      if (searchQuery.trim() === '') return true;
+      const query = searchQuery.toLowerCase();
+      return (
+          s.resourceId.toLowerCase().includes(query) || 
+          s.id.toLowerCase().includes(query)
+      );
+  });
+
+  const handleOpenAudit = (session: RecordedSession) => {
+    setSelectedSession(session);
+    setDecryptionStatus('locked');
+  };
+
+  const handleDecrypt = () => {
+    setDecryptionStatus('decrypting');
+    setTimeout(() => {
+      setDecryptionStatus('unlocked');
+    }, 2000);
+  };
+
+  // --- Analytics Logic (Overview) ---
+  const filteredSessionsForAnalytics = useMemo(() => {
+      return sessions.filter(s => {
+        if (selectedAnalyticsUser === 'all') return true;
+        return s.resourceId === selectedAnalyticsUser;
+    });
+  }, [sessions, selectedAnalyticsUser]);
+
+  const analyticsOverview = useMemo(() => {
+    let totalDurationSeconds = 0;
+    let cameraOnSeconds = 0;
+    const categoryStats: Record<string, number> = {
+        'Coding': 0, 'Study': 0, 'Training': 0, 'Meeting': 0, 'Work': 0, 'Idle': 0, 'Other': 0
+    };
+
+    filteredSessionsForAnalytics.forEach(session => {
+        totalDurationSeconds += session.duration;
+        session.logs.forEach(log => {
+             const duration = log.category === 'Idle' ? 60 : 15;
+             if (log.isCameraOn) cameraOnSeconds += duration;
+             
+             const key = Object.keys(categoryStats).find(k => k.toLowerCase() === (log.category || '').toLowerCase()) || 'Other';
+             categoryStats[key] += duration;
+        });
+    });
+
+    cameraOnSeconds = Math.min(cameraOnSeconds, totalDurationSeconds);
+    return {
+        totalDuration: totalDurationSeconds,
+        cameraDuration: cameraOnSeconds,
+        categories: categoryStats,
+        sessionCount: filteredSessionsForAnalytics.length
+    };
+  }, [filteredSessionsForAnalytics]);
+
+
+  // User Form Handling
   const handleUserFormSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!userFormUsername || !userFormPassword) return;
 
     if (isEditingUser && onUpdateUser && editingUserId) {
-        // Find original to preserve creation date
         const original = users.find(u => u.id === editingUserId);
         if (original) {
-            onUpdateUser({
-                ...original,
-                username: userFormUsername,
-                password: userFormPassword
-            });
+            onUpdateUser({ ...original, username: userFormUsername, password: userFormPassword });
         }
     } else if (!isEditingUser && onCreateUser) {
         onCreateUser({
-            id: '', // ID will be assigned by parent
+            id: '', 
             username: userFormUsername,
             password: userFormPassword,
             createdAt: Date.now()
@@ -96,37 +268,32 @@ export const Vault: React.FC<VaultProps> = ({
     }, 1000);
   };
 
-  // Filter sessions based on role and search query
-  const activeSessions = sessions.filter(s => {
-      // Role logic
-      const isVisibleForRole = role === 'admin' ? true : (s.status !== 'expired' && s.expiryTime > now);
-      if (!isVisibleForRole) return false;
-
-      // Search logic
-      if (searchQuery.trim() === '') return true;
-      const query = searchQuery.toLowerCase();
-      return (
-          s.resourceId.toLowerCase().includes(query) || 
-          s.id.toLowerCase().includes(query)
-      );
-  });
-
-  // Calculate high risk sessions count (sessions containing at least one high-risk log)
-  const highRiskSessionsCount = activeSessions.filter(session => 
-    session.logs.some(log => log.confidence === 'high')
-  ).length;
-
-  const handleOpenAudit = (session: RecordedSession) => {
-    setSelectedSession(session);
-    setDecryptionStatus('locked');
+  const handleOpenCreateUser = () => {
+    setIsEditingUser(false);
+    setEditingUserId(null);
+    setUserFormUsername('');
+    setUserFormPassword('');
+    setShowUserModal(true);
   };
 
-  const handleDecrypt = () => {
-    setDecryptionStatus('decrypting');
-    // Simulate API call to verify admin keys and fetch secure stream url
-    setTimeout(() => {
-      setDecryptionStatus('unlocked');
-    }, 2000);
+  const handleOpenEditUser = (user: ResourceUser) => {
+    setIsEditingUser(true);
+    setEditingUserId(user.id);
+    setUserFormUsername(user.username);
+    setUserFormPassword(user.password);
+    setShowUserModal(true);
+  };
+
+  const handleImportClick = () => {
+    importInputRef.current?.click();
+  };
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file && onImportUsers) {
+        onImportUsers(file);
+    }
+    if (e.target) e.target.value = '';
   };
 
   return (
@@ -157,10 +324,9 @@ export const Vault: React.FC<VaultProps> = ({
                 </div>
             </div>
 
-            {/* Admin Tabs */}
             <div className="flex border-b border-gray-800 mb-6">
                 <button 
-                    onClick={() => { setViewMode('sessions'); setSearchQuery(''); }}
+                    onClick={() => { setViewMode('sessions'); setSearchQuery(''); setAnalysisSessionId(null); }}
                     className={`pb-3 px-4 text-sm font-medium transition-colors ${viewMode === 'sessions' ? 'text-indigo-400 border-b-2 border-indigo-400' : 'text-gray-500 hover:text-white'}`}
                 >
                     Session Vault
@@ -170,6 +336,12 @@ export const Vault: React.FC<VaultProps> = ({
                     className={`pb-3 px-4 text-sm font-medium transition-colors ${viewMode === 'users' ? 'text-indigo-400 border-b-2 border-indigo-400' : 'text-gray-500 hover:text-white'}`}
                 >
                     Resource Management
+                </button>
+                <button 
+                    onClick={() => setViewMode('analytics')}
+                    className={`pb-3 px-4 text-sm font-medium transition-colors ${viewMode === 'analytics' ? 'text-indigo-400 border-b-2 border-indigo-400' : 'text-gray-500 hover:text-white'}`}
+                >
+                    Analytics & Insights
                 </button>
             </div>
         </>
@@ -188,22 +360,16 @@ export const Vault: React.FC<VaultProps> = ({
                         </div>
                         {role === 'admin' ? 'Session Recordings' : 'My Session History'}
                     </h2>
-                    <p className="text-gray-400 text-sm mt-1 ml-14">
-                        {role === 'admin' 
-                            ? 'Audit compliance recordings.' 
-                            : 'Review your recent sessions.'}
-                    </p>
                 </div>
                 <span className="text-sm text-gray-500 bg-gray-900 px-3 py-1 rounded-full border border-gray-800 hidden sm:block">
                     {role === 'admin' ? (
-                        <>Retention: <span className="text-gray-300 font-semibold">Manual Deletion</span></>
+                        <>Retention: <span className="text-gray-300 font-semibold">3 Days</span></>
                     ) : (
-                        <>Auto-deletion: <span className="text-gray-300 font-semibold">24 Hours</span></>
+                        <>Auto-deletion: <span className="text-gray-300 font-semibold">3 Days</span></>
                     )}
                 </span>
             </div>
 
-            {/* Search Bar */}
             <div className="mb-4 relative animate-fade-in">
                 <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
                     <svg className="h-4 w-4 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -231,15 +397,7 @@ export const Vault: React.FC<VaultProps> = ({
                 
                 {activeSessions.length === 0 ? (
                     <div className="p-16 text-center">
-                        <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-gray-800 mb-4">
-                            <svg className="w-8 h-8 text-gray-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
-                            </svg>
-                        </div>
-                        <h3 className="text-lg font-medium text-white">No Recordings Available</h3>
-                        {searchQuery && (
-                             <p className="text-gray-500 text-sm mt-2">Try adjusting your search criteria.</p>
-                        )}
+                        <p className="text-lg font-medium text-white">No Recordings Available</p>
                     </div>
                 ) : (
                     <div className="divide-y divide-gray-800">
@@ -248,47 +406,29 @@ export const Vault: React.FC<VaultProps> = ({
                                 <div className="col-span-3 flex flex-col justify-center">
                                     <div className="flex items-center gap-2">
                                         <span className={`w-2 h-2 rounded-full ${session.status === 'secure' ? 'bg-green-500' : 'bg-yellow-500'}`}></span>
-                                        <span className="text-sm font-medium text-indigo-400 truncate" title={session.resourceId}>
-                                            {session.resourceId}
-                                        </span>
+                                        <span className="text-sm font-medium text-indigo-400 truncate" title={session.resourceId}>{session.resourceId}</span>
                                     </div>
-                                    <span className="text-[10px] text-gray-600 font-mono truncate pl-4 mt-0.5" title={session.id}>
-                                        {session.id}
-                                    </span>
+                                    <span className="text-[10px] text-gray-600 font-mono truncate pl-4 mt-0.5" title={session.id}>{session.id}</span>
                                 </div>
                                 <div className="col-span-2 text-sm text-gray-300">
-                                    {new Date(session.startTime).toLocaleDateString()} <span className="text-gray-600 text-xs ml-1">{new Date(session.startTime).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</span>
+                                    {new Date(session.startTime).toLocaleDateString()}
                                 </div>
                                 <div className="col-span-2 text-sm text-gray-300 font-mono">
                                     {Math.floor(session.duration / 60)}m {session.duration % 60}s
                                 </div>
-                                <div className="col-span-2 text-sm text-gray-400">
-                                    {session.fileSize}
-                                </div>
+                                <div className="col-span-2 text-sm text-gray-400">{session.fileSize}</div>
                                 <div className="col-span-2">
                                     <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border ${session.expiryTime <= now ? 'bg-gray-800 text-gray-400 border-gray-700' : 'bg-red-500/10 text-red-400 border-red-500/20'}`}>
-                                        <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-                                        </svg>
                                         {getRemainingTime(session.expiryTime)}
                                     </span>
                                 </div>
                                 <div className="col-span-1 text-right flex items-center justify-end gap-2">
                                     {role === 'admin' && (
-                                        <button 
-                                            onClick={() => onDelete(session.id)}
-                                            title="Delete Recording"
-                                            className="p-1.5 text-gray-500 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors"
-                                        >
-                                            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                                            </svg>
+                                        <button onClick={() => onDelete(session.id)} className="p-1.5 text-gray-500 hover:text-red-400 hover:bg-red-500/10 rounded-lg">
+                                            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
                                         </button>
                                     )}
-                                    <button 
-                                        onClick={() => handleOpenAudit(session)}
-                                        className="bg-gray-800 hover:bg-indigo-600 hover:text-white text-gray-300 px-3 py-1.5 rounded text-xs font-medium transition-all transform group-hover:scale-105 shadow-sm whitespace-nowrap"
-                                    >
+                                    <button onClick={() => handleOpenAudit(session)} className="bg-gray-800 hover:bg-indigo-600 hover:text-white text-gray-300 px-3 py-1.5 rounded text-xs font-medium">
                                         {role === 'admin' ? 'Audit' : 'Playback'}
                                     </button>
                                 </div>
@@ -304,65 +444,219 @@ export const Vault: React.FC<VaultProps> = ({
       {role === 'admin' && viewMode === 'users' && (
           <div className="animate-fade-in">
               <div className="flex justify-between items-center mb-6">
-                 <div>
-                    <h2 className="text-xl font-bold text-white">Registered Resources</h2>
-                    <p className="text-gray-400 text-sm">Manage access credentials for remote monitoring.</p>
+                 <h2 className="text-xl font-bold text-white">Registered Resources</h2>
+                 <div className="flex gap-3">
+                     <button onClick={() => onExportUsers && onExportUsers()} className="bg-gray-800 hover:bg-gray-700 text-gray-300 px-3 py-2 rounded-lg text-sm font-medium border border-gray-700 flex items-center gap-2">
+                         <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                         Export
+                     </button>
+                     <button onClick={handleImportClick} className="bg-gray-800 hover:bg-gray-700 text-gray-300 px-3 py-2 rounded-lg text-sm font-medium border border-gray-700 flex items-center gap-2">
+                         <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg>
+                         Import
+                     </button>
+                     <input type="file" accept=".json" ref={importInputRef} className="hidden" onChange={handleFileChange} />
+                     
+                     <button onClick={handleOpenCreateUser} className="bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded-lg text-sm font-medium shadow-lg shadow-indigo-500/20 flex items-center gap-2">
+                         <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg>
+                         Add Resource
+                     </button>
                  </div>
-                 <button 
-                    onClick={handleOpenCreateUser}
-                    className="bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded-lg text-sm font-medium shadow-lg shadow-indigo-500/20 flex items-center gap-2"
-                 >
-                    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
-                    </svg>
-                    Add Resource
-                 </button>
+              </div>
+              <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden shadow-xl">
+                  {users.map((user) => (
+                     <div key={user.id} className="grid grid-cols-12 gap-4 p-4 items-center hover:bg-gray-800/30 border-b border-gray-800 last:border-0">
+                         <div className="col-span-4 flex items-center gap-3">
+                             <div className="w-8 h-8 rounded-full bg-indigo-500/20 flex items-center justify-center text-indigo-400">
+                                 <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" /></svg>
+                             </div>
+                             <span className="text-white font-medium">{user.username}</span>
+                         </div>
+                         <div className="col-span-4 text-gray-500 font-mono text-sm">••••••••</div>
+                         <div className="col-span-3 text-sm text-gray-400">{new Date(user.createdAt).toLocaleDateString()}</div>
+                         <div className="col-span-1 text-right">
+                             <button onClick={() => handleOpenEditUser(user)} className="text-gray-400 hover:text-white p-2">
+                                 <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" /></svg>
+                             </button>
+                         </div>
+                     </div>
+                  ))}
+              </div>
+          </div>
+      )}
+
+      {/* View: Analytics */}
+      {role === 'admin' && viewMode === 'analytics' && (
+          <div className="animate-fade-in space-y-8">
+              
+              {/* Top Bar: Selector */}
+              <div className="flex justify-between items-center">
+                  <div>
+                    <h2 className="text-xl font-bold text-white">Monitoring Analysis</h2>
+                    <p className="text-gray-400 text-sm">AI-driven breakdown of resource activity.</p>
+                  </div>
+                  <div className="relative">
+                      <select 
+                        value={selectedAnalyticsUser}
+                        onChange={(e) => { setSelectedAnalyticsUser(e.target.value); setAnalysisSessionId(null); }}
+                        className="appearance-none bg-gray-900 border border-gray-700 text-white py-2 pl-4 pr-10 rounded-lg focus:outline-none focus:border-indigo-500 cursor-pointer"
+                      >
+                          <option value="all">All Resources</option>
+                          {users.map(u => <option key={u.id} value={u.username}>{u.username}</option>)}
+                      </select>
+                  </div>
               </div>
 
-              <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden shadow-xl">
-                  <div className="grid grid-cols-12 gap-4 p-4 border-b border-gray-800 bg-gray-800/50 text-xs font-semibold text-gray-400 uppercase tracking-wider">
-                      <div className="col-span-4">Username / Resource ID</div>
-                      <div className="col-span-4">Password</div>
-                      <div className="col-span-3">Created</div>
-                      <div className="col-span-1 text-right">Edit</div>
-                  </div>
-                  
-                  {users.length === 0 ? (
-                      <div className="p-8 text-center text-gray-500">No users found.</div>
-                  ) : (
-                      <div className="divide-y divide-gray-800">
-                          {users.map((user) => (
-                             <div key={user.id} className="grid grid-cols-12 gap-4 p-4 items-center hover:bg-gray-800/30 transition-colors">
-                                 <div className="col-span-4 flex items-center gap-3">
-                                     <div className="w-8 h-8 rounded-full bg-indigo-500/20 flex items-center justify-center text-indigo-400">
-                                         <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
-                                         </svg>
-                                     </div>
-                                     <span className="text-white font-medium">{user.username}</span>
-                                 </div>
-                                 <div className="col-span-4 text-gray-500 font-mono text-sm">
-                                     ••••••••
-                                 </div>
-                                 <div className="col-span-3 text-sm text-gray-400">
-                                     {new Date(user.createdAt).toLocaleDateString()}
-                                 </div>
-                                 <div className="col-span-1 text-right">
-                                     <button 
-                                         onClick={() => handleOpenEditUser(user)}
-                                         className="text-gray-400 hover:text-white p-2 rounded hover:bg-gray-700 transition-colors"
-                                         title="Edit User"
-                                     >
-                                         <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-                                         </svg>
-                                     </button>
-                                 </div>
-                             </div>
-                          ))}
-                      </div>
-                  )}
-              </div>
+              {!analysisSessionId ? (
+                /* Overview & Session Selection */
+                <>
+                    {/* Stats */}
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                        <div className="bg-gray-900 border border-gray-800 rounded-xl p-6">
+                            <p className="text-gray-400 text-sm font-medium uppercase">Total Time</p>
+                            <p className="text-3xl font-bold text-white mt-2">{formatDuration(analyticsOverview.totalDuration)}</p>
+                        </div>
+                        <div className="bg-gray-900 border border-gray-800 rounded-xl p-6">
+                            <p className="text-gray-400 text-sm font-medium uppercase">Camera Active</p>
+                            <div className="flex items-baseline gap-2 mt-2">
+                                <p className="text-3xl font-bold text-white">{formatDuration(analyticsOverview.cameraDuration)}</p>
+                                <span className="text-sm font-medium text-green-500">
+                                    {getPercentage(analyticsOverview.cameraDuration, analyticsOverview.totalDuration)}%
+                                </span>
+                            </div>
+                        </div>
+                        <div className="bg-gray-900 border border-gray-800 rounded-xl p-6">
+                             <p className="text-gray-400 text-sm font-medium uppercase">Sessions</p>
+                             <p className="text-3xl font-bold text-white mt-2">{analyticsOverview.sessionCount}</p>
+                        </div>
+                    </div>
+
+                    {/* Recording Selection List */}
+                    <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden shadow-xl">
+                        <div className="p-4 border-b border-gray-800 bg-gray-800/30 font-semibold text-gray-300">
+                            Select Recording to Analyze
+                        </div>
+                        <div className="divide-y divide-gray-800">
+                            {filteredSessionsForAnalytics.length === 0 ? (
+                                <div className="p-8 text-center text-gray-500">No recordings found.</div>
+                            ) : filteredSessionsForAnalytics.map(session => (
+                                <div key={session.id} className="grid grid-cols-12 gap-4 p-4 items-center hover:bg-gray-800/30 transition-colors">
+                                    <div className="col-span-4 flex items-center gap-3">
+                                        <div className={`w-2 h-2 rounded-full ${session.status === 'secure' ? 'bg-green-500' : 'bg-yellow-500'}`}></div>
+                                        <div>
+                                            <p className="text-white font-medium">{session.resourceId}</p>
+                                            <p className="text-[10px] text-gray-500">{new Date(session.startTime).toLocaleDateString()} {new Date(session.startTime).toLocaleTimeString()}</p>
+                                        </div>
+                                    </div>
+                                    <div className="col-span-4 text-sm text-gray-400">
+                                        Duration: {formatDuration(session.duration)}
+                                    </div>
+                                    <div className="col-span-4 text-right">
+                                        <button 
+                                            onClick={() => setAnalysisSessionId(session.id)}
+                                            className="bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-1.5 rounded text-sm font-medium"
+                                        >
+                                            Detailed Analysis
+                                        </button>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                </>
+              ) : (
+                /* Detailed Analysis View */
+                detailedAnalysis ? (
+                    <div className="animate-fade-in-up">
+                        <button 
+                            onClick={() => setAnalysisSessionId(null)}
+                            className="mb-4 flex items-center gap-2 text-gray-400 hover:text-white transition-colors"
+                        >
+                            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 19l-7-7m0 0l7-7m-7 7h18" /></svg>
+                            Back to List
+                        </button>
+
+                        <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden shadow-2xl">
+                            <div className="p-6 border-b border-gray-800 bg-gray-800/50 flex justify-between items-center">
+                                <div>
+                                    <h3 className="text-xl font-bold text-white">Session Breakdown</h3>
+                                    <p className="text-sm text-gray-400 mt-1">
+                                        Resource: <span className="text-indigo-400">{detailedAnalysis.session.resourceId}</span> • 
+                                        Date: {new Date(detailedAnalysis.session.startTime).toLocaleDateString()}
+                                    </p>
+                                </div>
+                                <div className="text-right">
+                                    <p className="text-xs text-gray-500 uppercase">Total Duration</p>
+                                    <p className="text-2xl font-mono font-bold text-white">{formatDuration(detailedAnalysis.session.duration)}</p>
+                                </div>
+                            </div>
+
+                            <div className="p-6 space-y-6">
+                                {detailedAnalysis.segments.length === 0 ? (
+                                    <p className="text-center text-gray-500 py-8">No analysis data available for this session.</p>
+                                ) : (
+                                    detailedAnalysis.segments.map((segment, idx) => (
+                                    <div key={idx} className="flex gap-6 border-l-2 border-gray-800 pl-6 relative">
+                                        {/* Timeline Dot */}
+                                        <div className={`absolute -left-[9px] top-0 w-4 h-4 rounded-full border-4 border-gray-900 
+                                            ${segment.category === 'Coding' ? 'bg-blue-500' : 
+                                              segment.category === 'Meeting' ? 'bg-purple-500' :
+                                              segment.category === 'Idle' ? 'bg-gray-600' : 'bg-green-500'}`}>
+                                        </div>
+
+                                        {/* Content */}
+                                        <div className="flex-1">
+                                            <div className="flex items-center gap-3 mb-2">
+                                                <span className="text-sm font-mono text-gray-500">
+                                                    {new Date(segment.startTime).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})} 
+                                                    - 
+                                                    {new Date(segment.endTime).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}
+                                                </span>
+                                                <span className={`px-2 py-0.5 rounded text-xs font-bold uppercase
+                                                     ${segment.category === 'Coding' ? 'bg-blue-900/30 text-blue-400' : 
+                                                       segment.category === 'Meeting' ? 'bg-purple-900/30 text-purple-400' :
+                                                       segment.category === 'Idle' ? 'bg-gray-800 text-gray-400' : 'bg-green-900/30 text-green-400'}`}>
+                                                    {segment.category}
+                                                </span>
+                                            </div>
+                                            <p className="text-gray-300 text-sm mb-3">
+                                                Time Spent: <span className="text-white font-medium">{Math.round(segment.duration / 60)} minutes</span>
+                                            </p>
+                                            
+                                            {/* Screenshot Thumbnail */}
+                                            {segment.screenshot ? (
+                                                <div className="w-48 h-28 rounded-lg overflow-hidden border border-gray-700 relative group cursor-pointer hover:border-indigo-500 transition-colors">
+                                                    <img src={segment.screenshot} alt="Screen Context" className="w-full h-full object-cover" />
+                                                    <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                                                        <span className="text-xs text-white font-medium">View Frame</span>
+                                                    </div>
+                                                </div>
+                                            ) : (
+                                                <div className="w-48 h-28 rounded-lg bg-gray-800 border border-gray-700 flex items-center justify-center text-gray-600 text-xs">
+                                                    No Preview
+                                                </div>
+                                            )}
+                                        </div>
+                                    </div>
+                                )))}
+                            </div>
+                        </div>
+                    </div>
+                ) : (
+                    <div className="flex justify-center items-center py-20">
+                        {isLoadingAnalysis ? (
+                            <div className="text-indigo-400 animate-pulse flex flex-col items-center">
+                                <svg className="w-8 h-8 mb-2 animate-spin" fill="none" viewBox="0 0 24 24">
+                                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                </svg>
+                                <span>Loading Analysis Data...</span>
+                            </div>
+                        ) : (
+                            <p className="text-gray-500">Failed to load detailed analysis.</p>
+                        )}
+                    </div>
+                )
+              )}
           </div>
       )}
 
@@ -394,7 +688,7 @@ export const Vault: React.FC<VaultProps> = ({
                 
                 <div className="flex-1 overflow-y-auto p-6 bg-gray-950">
                     <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-                        {/* Video Player Mock */}
+                        {/* Video Player */}
                         <div className="lg:col-span-2 space-y-4">
                             <div className="flex items-center justify-between">
                                 <h4 className="text-gray-400 text-sm font-semibold uppercase tracking-wider">Secure Video Playback</h4>
@@ -414,9 +708,17 @@ export const Vault: React.FC<VaultProps> = ({
                                             controls 
                                             className="w-full h-full object-contain"
                                         />
+                                    ) : videoLoading ? (
+                                        <div className="flex flex-col items-center justify-center text-indigo-400 animate-pulse">
+                                           <svg className="w-8 h-8 mb-2 animate-spin" fill="none" viewBox="0 0 24 24">
+                                               <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                               <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                           </svg>
+                                           <span>Retrieving Secure Footage...</span>
+                                        </div>
                                     ) : (
                                         <div className="text-center text-gray-500">
-                                            <p>Recording data was not retained (mock mode).</p>
+                                            <p>Video data unavailable or expired.</p>
                                         </div>
                                     )
                                 ) : (
@@ -439,7 +741,7 @@ export const Vault: React.FC<VaultProps> = ({
                                     
                                     {decryptionStatus === 'locked' && (
                                       <button 
-                                        onClick={handleDecrypt}
+                                        onClick={() => handleDecrypt()}
                                         className="bg-indigo-600 hover:bg-indigo-500 text-white px-6 py-2 rounded-lg text-sm font-medium transition-colors shadow-lg shadow-indigo-500/20 flex items-center gap-2"
                                       >
                                         <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -493,12 +795,19 @@ export const Vault: React.FC<VaultProps> = ({
                                                 </div>
                                                 <div className="flex justify-between items-start mb-1">
                                                     <span className="text-xs font-mono text-gray-500 group-hover:text-gray-300">{new Date(log.timestamp).toLocaleTimeString()}</span>
-                                                    <span className={`text-[10px] uppercase font-bold px-2 py-0.5 rounded-full
+                                                    <span className={`text-[10px] uppercase font-bold px-2 py-0.5 rounded-full mr-2
                                                         ${log.type === 'meeting' ? 'bg-purple-900/50 text-purple-300' : 'bg-gray-800 text-gray-300'}`}>
                                                         {log.type}
                                                     </span>
+                                                    <span className="text-[10px] text-gray-500 border border-gray-700 rounded px-1">{log.category}</span>
                                                 </div>
                                                 <p className="text-sm text-gray-300 leading-relaxed">{log.message}</p>
+                                                {log.isCameraOn && (
+                                                    <div className="flex items-center gap-1 mt-1 text-[10px] text-green-500/70">
+                                                        <div className="w-1 h-1 bg-green-500 rounded-full"></div>
+                                                        Cam Active
+                                                    </div>
+                                                )}
                                             </div>
                                         ))}
                                     </div>
@@ -511,59 +820,22 @@ export const Vault: React.FC<VaultProps> = ({
         </div>
       )}
 
-      {/* User Form Modal (Create/Edit) */}
+      {/* User Modal (Create/Edit) */}
       {showUserModal && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-fade-in">
              <div className="bg-gray-900 rounded-2xl border border-gray-700 w-full max-w-md shadow-2xl overflow-hidden">
                 <div className="bg-gray-800 px-6 py-4 flex justify-between items-center border-b border-gray-700">
                     <h3 className="text-white font-bold text-lg">{isEditingUser ? 'Edit Resource' : 'Create Resource'}</h3>
-                    <button onClick={() => setShowUserModal(false)} className="text-gray-400 hover:text-white">
-                        <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                        </svg>
-                    </button>
+                    <button onClick={() => setShowUserModal(false)} className="text-gray-400 hover:text-white"><svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg></button>
                 </div>
                 <div className="p-6">
                     {formSuccess ? (
-                        <div className="text-center py-8">
-                             <div className="w-12 h-12 bg-green-500/20 rounded-full flex items-center justify-center mx-auto mb-3">
-                                 <svg className="w-6 h-6 text-green-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                                 </svg>
-                             </div>
-                             <h4 className="text-white font-medium">{isEditingUser ? 'Updated Successfully' : 'Created Successfully'}</h4>
-                        </div>
+                        <div className="text-center py-8"><h4 className="text-white font-medium">Success</h4></div>
                     ) : (
                         <form onSubmit={handleUserFormSubmit} className="space-y-4">
-                            <div>
-                                <label className="block text-xs font-medium text-gray-400 uppercase tracking-wider mb-2">Username / Resource ID</label>
-                                <input 
-                                    type="text" 
-                                    value={userFormUsername}
-                                    onChange={(e) => setUserFormUsername(e.target.value)}
-                                    className="w-full bg-gray-950 border border-gray-800 rounded-lg px-4 py-2 text-white focus:border-indigo-500 outline-none"
-                                    placeholder="e.g. employee.name"
-                                    required
-                                />
-                            </div>
-                            <div>
-                                <label className="block text-xs font-medium text-gray-400 uppercase tracking-wider mb-2">Password</label>
-                                <input 
-                                    type="text" 
-                                    value={userFormPassword}
-                                    onChange={(e) => setUserFormPassword(e.target.value)}
-                                    className="w-full bg-gray-950 border border-gray-800 rounded-lg px-4 py-2 text-white focus:border-indigo-500 outline-none"
-                                    placeholder="••••••••"
-                                    required
-                                />
-                                <p className="text-[10px] text-gray-500 mt-1">Visible for admin convenience.</p>
-                            </div>
-                            <button 
-                                type="submit"
-                                className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-2.5 rounded-lg mt-4 transition-colors"
-                            >
-                                {isEditingUser ? 'Save Changes' : 'Create Credentials'}
-                            </button>
+                            <div><label className="block text-xs font-medium text-gray-400 uppercase tracking-wider mb-2">Username</label><input type="text" value={userFormUsername} onChange={(e) => setUserFormUsername(e.target.value)} className="w-full bg-gray-950 border border-gray-800 rounded-lg px-4 py-2 text-white" required /></div>
+                            <div><label className="block text-xs font-medium text-gray-400 uppercase tracking-wider mb-2">Password</label><input type="text" value={userFormPassword} onChange={(e) => setUserFormPassword(e.target.value)} className="w-full bg-gray-950 border border-gray-800 rounded-lg px-4 py-2 text-white" required /></div>
+                            <button type="submit" className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-2.5 rounded-lg mt-4">Save</button>
                         </form>
                     )}
                 </div>

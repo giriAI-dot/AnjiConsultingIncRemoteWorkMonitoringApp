@@ -34,12 +34,21 @@ export const analyzeSessionContext = async (
 
     parts.push({
       text: `Analyze this snapshot of an employee's screen ${audioData ? 'and the accompanying audio snippet' : ''}. 
-      Determine the work context. 
-      If there is audio, summarize what is being discussed briefly.
+      Determine the work context and categorize the activity precisely.
+      
+      Categories:
+      - "Coding": IDEs, text editors, terminal, code documentation.
+      - "Study": Reading documentation, research papers, educational articles.
+      - "Training": Watching training videos, tutorials, webinars.
+      - "Meeting": Video calls, calendar apps, collaboration tools.
+      - "Work": General productive work, emails, spreadsheets.
+      - "Idle": Desktop background, lock screen, no activity.
+      - "Other": Social media, entertainment, unrelated content.
+
       Return a JSON object with:
       - summary: Short description of activity (max 15 words).
-      - category: "Meeting", "Coding", "Email", "Browsing", or "Idle".
-      - riskLevel: "low" (working), "medium" (social media/distracted), "high" (sensitive data leak or inappropriate).`
+      - category: One of the categories listed above.
+      - riskLevel: "low" (working), "medium" (distracted), "high" (inappropriate/unsafe).`
     });
 
     const response = await ai.models.generateContent({
@@ -69,7 +78,7 @@ export const analyzeSessionContext = async (
     // Return a safe fallback so the UI doesn't crash
     return {
       summary: "AI analysis temporarily unavailable.",
-      category: "Monitoring",
+      category: "Work",
       riskLevel: "low"
     };
   }

@@ -12,20 +12,49 @@ const App: React.FC = () => {
   const [username, setUsername] = useState('');
 
   // Data State
-  const [sessions, setSessions] = useState<RecordedSession[]>([]);
+  const [sessions, setSessions] = useState<RecordedSession[]>(() => {
+    try {
+      const saved = localStorage.getItem('sw_sessions');
+      return saved ? JSON.parse(saved) : [];
+    } catch (e) {
+      console.warn("Failed to load sessions", e);
+      return [];
+    }
+  });
   
-  // User Management State (Persisted in localStorage for demo purposes)
+  // User Management State (Persisted in localStorage)
   const [resourceUsers, setResourceUsers] = useState<ResourceUser[]>(() => {
-    const saved = localStorage.getItem('sw_users');
-    return saved ? JSON.parse(saved) : [
-      // Default demo user
-      { id: 'u_1', username: 'employee1', password: 'password', createdAt: Date.now() }
-    ];
+    try {
+      const saved = localStorage.getItem('sw_users');
+      return saved ? JSON.parse(saved) : [
+        // Default demo user - only used if absolutely no data exists
+        { id: 'u_1', username: 'employee1', password: 'password', createdAt: Date.now() }
+      ];
+    } catch (e) {
+      console.warn("Failed to load users", e);
+      return [{ id: 'u_1', username: 'employee1', password: 'password', createdAt: Date.now() }];
+    }
   });
 
   useEffect(() => {
     localStorage.setItem('sw_users', JSON.stringify(resourceUsers));
   }, [resourceUsers]);
+
+  useEffect(() => {
+    // Persist sessions metadata. 
+    // We strip videoUrl AND thumbnails to avoid saving large blobs/strings in LocalStorage.
+    // Full logs with thumbnails should be loaded from IndexedDB in components that need them.
+    const sessionsToSave = sessions.map(s => {
+      const { videoUrl, logs, ...rest } = s;
+      // Strip thumbnails from logs for lightweight storage
+      const lightLogs = logs.map(log => {
+          const { thumbnail, ...logRest } = log;
+          return logRest;
+      });
+      return { ...rest, logs: lightLogs };
+    });
+    localStorage.setItem('sw_sessions', JSON.stringify(sessionsToSave));
+  }, [sessions]);
 
   const handleLogin = (role: 'resource' | 'admin', name: string) => {
     setIsAuthenticated(true);
@@ -53,24 +82,54 @@ const App: React.FC = () => {
         setSessions(prev => prev.map(s => s.resourceId === oldUser.username ? { ...s, resourceId: updatedUser.username } : s));
     }
     
-    // If the currently logged in admin somehow updated themselves (not possible in this flow but good practice) or if we were editing the current user
+    // If the currently logged in admin somehow updated themselves
     if (username === oldUser?.username) {
         setUsername(updatedUser.username);
     }
   };
 
-  const handleSessionComplete = (duration: number, logs: SessionLog[], videoUrl?: string) => {
-    // Simulate creating a secure record
+  const handleExportResources = () => {
+    const dataStr = JSON.stringify(resourceUsers, null, 2);
+    const dataUri = 'data:application/json;charset=utf-8,'+ encodeURIComponent(dataStr);
+    const exportFileDefaultName = 'resource_config.json';
+    const linkElement = document.createElement('a');
+    linkElement.setAttribute('href', dataUri);
+    linkElement.setAttribute('download', exportFileDefaultName);
+    linkElement.click();
+  };
+
+  const handleImportResources = (file: File) => {
+    const reader = new FileReader();
+    reader.onload = (event) => {
+        try {
+            const imported = JSON.parse(event.target?.result as string);
+            if (Array.isArray(imported)) {
+                setResourceUsers(imported);
+                alert("Resources imported successfully.");
+            } else {
+                alert("Invalid format: File must contain a JSON array of users.");
+            }
+        } catch (err) {
+            console.error("Import failed", err);
+            alert("Invalid configuration file.");
+        }
+    };
+    reader.readAsText(file);
+  };
+
+  const handleSessionComplete = (sessionId: string, duration: number, logs: SessionLog[], videoUrl?: string) => {
+    // sessionId passed from LiveMonitor matches what was used for DB storage.
+    
     const newSession: RecordedSession = {
-      id: crypto.randomUUID(),
+      id: sessionId, 
       resourceId: username,
       startTime: Date.now() - (duration * 1000),
       duration: duration,
       status: 'secure',
       // Simulate file size based on rough bitrate estimate
       fileSize: `${Math.max(1, Math.floor(duration / 60 * 2.5))} MB`, 
-      // Expires in 24 hours
-      expiryTime: Date.now() + (24 * 60 * 60 * 1000),
+      // Expires in 3 days
+      expiryTime: Date.now() + (3 * 24 * 60 * 60 * 1000),
       logs: logs,
       videoUrl: videoUrl
     };
@@ -111,7 +170,7 @@ const App: React.FC = () => {
                         <h4 className="text-white font-medium">Compliance Monitoring Active</h4>
                         <p className="text-gray-400 text-sm mt-1">
                             Welcome, {username}. This session captures screen and audio data for compliance. 
-                            Data is encrypted and automatically purged after 24 hours.
+                            Data is encrypted and automatically purged after 3 days.
                         </p>
                     </div>
                 </div>
@@ -143,6 +202,8 @@ const App: React.FC = () => {
                   onCreateUser={handleCreateUser}
                   users={resourceUsers}
                   onUpdateUser={handleUpdateUser}
+                  onExportUsers={handleExportResources}
+                  onImportUsers={handleImportResources}
                 />
             </div>
         )}

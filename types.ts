@@ -3,8 +3,11 @@ export interface SessionLog {
   resourceId?: string;
   timestamp: number;
   type: 'compliance' | 'activity' | 'meeting';
+  category: string;
+  isCameraOn: boolean;
   message: string;
   confidence: string;
+  thumbnail?: string; // Base64 screenshot
 }
 
 export interface RecordedSession {

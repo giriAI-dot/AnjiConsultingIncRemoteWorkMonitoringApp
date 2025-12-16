@@ -1,6 +1,13 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { MonitoringState, AnalysisResult, SessionLog } from '../types';
 import { analyzeSessionContext } from '../services/geminiService';
+import { 
+    saveRecoveryChunks, 
+    loadRecoveryChunks, 
+    clearRecoveryChunks, 
+    saveLogsToDB, 
+    saveVideoToDB 
+} from '../services/db';
 
 // --- Global Declarations for MediaPipe ---
 declare global {
@@ -19,63 +26,6 @@ interface BgConfig {
     sourceType: 'default' | 'custom';
     customImage: HTMLImageElement | null;
 }
-
-// --- IndexedDB Helpers for Heavy Video Storage ---
-const DB_NAME = 'SecureWorkDB';
-const STORE_NAME = 'session_chunks';
-
-const initDB = (): Promise<IDBDatabase> => {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, 1);
-    request.onupgradeneeded = (e: any) => {
-      const db = e.target.result;
-      if (!db.objectStoreNames.contains(STORE_NAME)) {
-        db.createObjectStore(STORE_NAME);
-      }
-    };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
-  });
-};
-
-const saveChunksToDB = async (chunks: Blob[]) => {
-  try {
-    const db = await initDB();
-    return new Promise<void>((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, 'readwrite');
-      tx.objectStore(STORE_NAME).put(chunks, 'active_session');
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
-    });
-  } catch (e) {
-    console.error("Failed to save chunks to DB", e);
-  }
-};
-
-const loadChunksFromDB = async (): Promise<Blob[]> => {
-  try {
-    const db = await initDB();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, 'readonly');
-      const req = tx.objectStore(STORE_NAME).get('active_session');
-      req.onsuccess = () => resolve(req.result || []);
-      req.onerror = () => reject(req.error);
-    });
-  } catch (e) {
-    return [];
-  }
-};
-
-const clearSessionStorage = async () => {
-  localStorage.removeItem('sw_session_meta');
-  try {
-    const db = await initDB();
-    const tx = db.transaction(STORE_NAME, 'readwrite');
-    tx.objectStore(STORE_NAME).delete('active_session');
-  } catch (e) {
-    console.error("Failed to clear DB", e);
-  }
-};
 
 // --- Logo Background Generator ---
 const getLogoBackgroundInfo = () => {
@@ -102,7 +52,7 @@ const getLogoBackgroundInfo = () => {
 
 interface LiveMonitorProps {
   username: string;
-  onSessionComplete: (duration: number, logs: SessionLog[], videoBlobUrl?: string) => void;
+  onSessionComplete: (sessionId: string, duration: number, logs: SessionLog[], videoBlobUrl?: string) => void;
 }
 
 export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionComplete }) => {
@@ -152,6 +102,8 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
 
   // Ref for access in callbacks
   const bgConfigRef = useRef(bgConfig);
+  // Ref for camera state in callbacks
+  const isCameraEnabledRef = useRef(isCameraEnabled);
   
   const videoRef = useRef<HTMLVideoElement>(null); // Screen Video
   const cameraVideoRef = useRef<HTMLVideoElement>(null); // Camera Video (Raw or Processed)
@@ -161,6 +113,7 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
   const processedCanvasRef = useRef<HTMLCanvasElement>(null);
   const segmentationRef = useRef<any>(null);
   const backgroundImageRef = useRef<HTMLImageElement | null>(null);
+  const isSegmentationReadyRef = useRef(false);
   
   // Streams
   const streamRef = useRef<MediaStream | null>(null); // Final Recording Stream
@@ -179,9 +132,16 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
   const loopsRef = useRef<number[]>([]); // Cleanup intervals
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // Tracks session ID for DB persistence
+  const [activeSessionId, setActiveSessionId] = useState(() => crypto.randomUUID());
+
   useEffect(() => {
     stateRef.current = { status, elapsedTime, logs };
   }, [status, elapsedTime, logs]);
+
+  useEffect(() => {
+    isCameraEnabledRef.current = isCameraEnabled;
+  }, [isCameraEnabled]);
 
   // Activity Listeners for Idle Detection
   useEffect(() => {
@@ -193,12 +153,14 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
     window.addEventListener('keydown', handleActivity);
     window.addEventListener('click', handleActivity);
     window.addEventListener('scroll', handleActivity);
+    window.addEventListener('touchstart', handleActivity); // Added for mobile
 
     return () => {
         window.removeEventListener('mousemove', handleActivity);
         window.removeEventListener('keydown', handleActivity);
         window.removeEventListener('click', handleActivity);
         window.removeEventListener('scroll', handleActivity);
+        window.removeEventListener('touchstart', handleActivity);
     };
   }, []);
 
@@ -217,14 +179,19 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
                     ? 'Idle detected: Reducing analysis frequency' 
                     : 'User Active: Resuming standard analysis';
                 
-                setLogs(prev => [{
+                const newLog: SessionLog = {
                     id: Date.now().toString(),
                     resourceId: username,
                     timestamp: Date.now(),
                     type: 'activity',
+                    category: currentlyIdle ? 'Idle' : 'Work',
+                    isCameraOn: isCameraEnabledRef.current,
                     message: logMessage,
-                    confidence: 'low'
-                }, ...prev]);
+                    confidence: 'low',
+                    // No thumbnail for status change logs usually
+                };
+                
+                setLogs(prev => [newLog, ...prev]);
                 
                 return currentlyIdle;
             }
@@ -260,7 +227,8 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
       const meta = localStorage.getItem('sw_session_meta');
       if (meta) {
         const parsed = JSON.parse(meta);
-        if (Date.now() - parsed.timestamp < 86400000) { // 24 hours
+        // Update to 3 days (3 * 24 * 60 * 60 * 1000 = 259200000 ms)
+        if (Date.now() - parsed.timestamp < 259200000) { 
            setRecoveryMeta(parsed);
            setShowRecovery(true);
         }
@@ -292,6 +260,7 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
     if (status !== MonitoringState.IDLE) {
         if (videoRef.current && screenStreamRef.current) {
             videoRef.current.srcObject = screenStreamRef.current;
+            videoRef.current.play().catch(e => console.debug("Auto-play prevented (screen)", e));
         }
         
         // Update Camera Preview source
@@ -311,13 +280,22 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
   const saveSessionToStorage = (time: number, currentLogs: SessionLog[], chunks: Blob[]) => {
       const meta = {
           elapsedTime: time,
-          logs: currentLogs,
+          logs: currentLogs.map(l => { 
+             // Strip thumbnail for lightweight meta storage in localStorage
+             // Full logs are saved to DB
+             const { thumbnail, ...rest } = l;
+             return rest;
+          }),
           timestamp: Date.now(),
           wasRecording: true
       };
       localStorage.setItem('sw_session_meta', JSON.stringify(meta));
       if (chunks.length > 0) {
-          saveChunksToDB(chunks);
+          saveRecoveryChunks(chunks);
+      }
+      // Save full logs to DB
+      if (currentLogs.length > 0) {
+          saveLogsToDB(activeSessionId, currentLogs);
       }
   };
 
@@ -325,7 +303,7 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
       if (recoveryMeta) {
           setElapsedTime(recoveryMeta.elapsedTime);
           setLogs(recoveryMeta.logs);
-          const savedChunks = await loadChunksFromDB();
+          const savedChunks = await loadRecoveryChunks();
           chunksRef.current = savedChunks;
           
           // Reset activity timer
@@ -338,7 +316,8 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
   };
 
   const handleDiscardSession = async () => {
-      await clearSessionStorage();
+      await clearRecoveryChunks();
+      localStorage.removeItem('sw_session_meta');
       setShowRecovery(false);
       setRecoveryMeta(null);
   };
@@ -383,6 +362,8 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
   };
 
   const onSegmentationResults = (results: any) => {
+      if (!isSegmentationReadyRef.current) return;
+
       const canvas = processedCanvasRef.current;
       if (!canvas) return;
       const ctx = canvas.getContext('2d');
@@ -400,9 +381,6 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
 
       ctx.save();
       ctx.clearRect(0, 0, width, height);
-
-      // Note: If mode is 'none', this canvas is not used for display/recording, 
-      // as we fallback to raw stream. But we keep logic here for consistency.
 
       // --- Mode: BLUR ---
       if (config.mode === 'blur') {
@@ -447,12 +425,15 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
       loopsRef.current.forEach(id => clearInterval(id));
       loopsRef.current = [];
       
+      isSegmentationReadyRef.current = false;
+
       if (segmentationRef.current) {
           const seg = segmentationRef.current;
           segmentationRef.current = null; 
+          // Delay close to prevent "Aborted" if sending data concurrently
           setTimeout(() => {
               try { seg.close(); } catch (e) { console.debug("Error closing segmentation:", e); }
-          }, 100);
+          }, 200);
       }
   };
 
@@ -495,6 +476,16 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
         canvasRef.current.width = videoRef.current.videoWidth;
         canvasRef.current.height = videoRef.current.videoHeight;
         ctx.drawImage(videoRef.current, 0, 0);
+        
+        // Capture thumbnail (Low res)
+        const thumbnailCanvas = document.createElement('canvas');
+        thumbnailCanvas.width = 160;
+        thumbnailCanvas.height = 90;
+        const tCtx = thumbnailCanvas.getContext('2d');
+        if (tCtx) tCtx.drawImage(canvasRef.current, 0, 0, 160, 90);
+        const thumbnailBase64 = thumbnailCanvas.toDataURL('image/jpeg', 0.5);
+
+        // Capture High Res for Gemini
         const imageBase64 = canvasRef.current.toDataURL('image/jpeg', 0.5).split(',')[1];
         
         let audioData = null;
@@ -515,8 +506,11 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
           resourceId: username,
           timestamp: Date.now(),
           type: result.category === 'Meeting' ? 'meeting' : 'activity',
+          category: result.category, // Capture specific category
+          isCameraOn: isCameraEnabledRef.current, // Capture camera state
           message: result.summary,
-          confidence: result.riskLevel
+          confidence: result.riskLevel,
+          thumbnail: thumbnailBase64 // Store the thumbnail
         };
 
         setLogs(prev => [newLog, ...prev]); 
@@ -535,6 +529,7 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
     try {
       if (status === MonitoringState.IDLE) {
           chunksRef.current = [];
+          setActiveSessionId(crypto.randomUUID());
       }
 
       // Reset idle timer
@@ -544,18 +539,20 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
       // 1. Get Raw User Media (Camera + Mic)
       const userStream = await navigator.mediaDevices.getUserMedia({ 
         audio: true,
-        video: { width: 640, height: 360, facingMode: 'user' }
+        video: { 
+            width: { ideal: 640 }, 
+            height: { ideal: 360 }, 
+            facingMode: 'user' 
+        }
       });
       rawCameraStreamRef.current = userStream;
       setIsCameraEnabled(true);
 
       // 2. Initialize MediaPipe Segmentation
-      // We do NOT use the window.Camera utility because it relies on requestAnimationFrame
-      // which stops when the tab is backgrounded. We use setInterval instead.
       if (window.SelfieSegmentation && processedCanvasRef.current) {
           try {
               const segmentation = new window.SelfieSegmentation({locateFile: (file: string) => {
-                  return `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${file}`;
+                  return `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation@0.1.1675465747/${file}`;
               }});
               segmentation.setOptions({
                   modelSelection: 1, 
@@ -563,6 +560,7 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
               });
               segmentation.onResults(onSegmentationResults);
               segmentationRef.current = segmentation;
+              isSegmentationReadyRef.current = true;
 
               // Setup a dummy video to feed MediaPipe
               const dummyVideo = document.createElement('video');
@@ -578,10 +576,14 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
 
               // Custom Loop for Segmentation (30 FPS)
               const segInterval = window.setInterval(async () => {
-                  if (segmentationRef.current && dummyVideo.readyState >= 2) {
+                  if (segmentationRef.current && dummyVideo.readyState >= 2 && isSegmentationReadyRef.current) {
                        // Only process if we need virtual background
                        if (bgConfigRef.current.mode !== 'none') {
-                           await segmentation.send({image: dummyVideo});
+                           try {
+                               await segmentation.send({image: dummyVideo});
+                           } catch(e) {
+                               console.debug("Segmentation send error (ignored):", e);
+                           }
                        }
                   }
               }, 33);
@@ -598,14 +600,35 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
       }
 
       // 4. Get Display Media (Screen)
-      const screenStream = await navigator.mediaDevices.getDisplayMedia({ 
-        video: { width: 1280, height: 720 }, 
-        audio: true 
-      });
+      let screenStream: MediaStream;
+      try {
+          if (!navigator.mediaDevices?.getDisplayMedia) {
+             throw new Error("getDisplayMedia not supported");
+          }
+          
+          screenStream = await navigator.mediaDevices.getDisplayMedia({ 
+            video: { width: 1280, height: 720 }, 
+            audio: true 
+          });
+      } catch (err) {
+          console.warn("Screen share unavailable (mobile or denied). Using fallback.", err);
+          const fallbackCanvas = document.createElement('canvas');
+          fallbackCanvas.width = 1280;
+          fallbackCanvas.height = 720;
+          const ctx = fallbackCanvas.getContext('2d');
+          if (ctx) {
+              ctx.fillStyle = '#1f2937'; 
+              ctx.fillRect(0, 0, 1280, 720);
+              ctx.fillStyle = '#9ca3af'; 
+              ctx.font = 'bold 30px sans-serif';
+              ctx.fillText('Screen Capture Unavailable', 100, 360);
+          }
+          screenStream = fallbackCanvas.captureStream(10); 
+      }
+      
       screenStreamRef.current = screenStream;
 
-      // 5. Setup Compositor for Recording (Screen + Camera PIP)
-      // This ensures Camera is included in the recorded file and works in background via setInterval
+      // 5. Setup Compositor
       const compCanvas = compositorCanvasRef.current;
       if (compCanvas) {
           compCanvas.width = 1280;
@@ -615,7 +638,6 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
               const ctx = compCanvas.getContext('2d');
               if (!ctx) return;
               
-              // Draw Screen (Full)
               if (videoRef.current && videoRef.current.readyState >= 2) {
                   ctx.drawImage(videoRef.current, 0, 0, 1280, 720);
               } else {
@@ -623,8 +645,6 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
                   ctx.fillRect(0, 0, 1280, 720);
               }
 
-              // Draw Camera PIP (Bottom Right) if enabled
-              // Use the active camera source (raw or processed)
               const camVideo = cameraVideoRef.current;
               if (isCameraEnabled && camVideo && camVideo.readyState >= 2) {
                   const pipW = 320;
@@ -633,33 +653,27 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
                   const pipY = 720 - pipH - 20;
                   
                   ctx.save();
-                  // Add border/shadow for PIP
                   ctx.shadowColor = 'rgba(0,0,0,0.5)';
                   ctx.shadowBlur = 10;
                   ctx.strokeStyle = '#374151';
                   ctx.lineWidth = 2;
-                  
                   ctx.strokeRect(pipX, pipY, pipW, pipH);
                   ctx.drawImage(camVideo, pipX, pipY, pipW, pipH);
                   ctx.restore();
               }
           };
 
-          // Run compositor at 30 FPS using setInterval to survive background throttling (mostly)
           const compInterval = window.setInterval(drawCompositor, 33);
           loopsRef.current.push(compInterval);
       }
 
-      // 6. Create Final Recording Stream from Compositor
+      // 6. Create Final Recording Stream
       const recordingStream = compCanvas!.captureStream(30);
-      
-      // Add Audio Tracks (Mic + System Audio)
       const audioTracks = [
           ...userStream.getAudioTracks(),
           ...screenStream.getAudioTracks()
       ];
       audioTracks.forEach(track => recordingStream.addTrack(track));
-      
       streamRef.current = recordingStream;
 
       const recorder = new MediaRecorder(recordingStream, {
@@ -685,13 +699,20 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
 
       startAnalysisLoop();
 
-      screenStream.getVideoTracks()[0].onended = () => {
-        stopMonitoring();
-      };
+      const screenVideoTrack = screenStream.getVideoTracks()[0];
+      if (screenVideoTrack && screenVideoTrack.readyState === 'live' && !screenVideoTrack.label.includes('canvas')) {
+          screenVideoTrack.onended = () => {
+            stopMonitoring();
+          };
+      }
 
     } catch (err: any) {
       console.error("Error starting capture:", err);
-      alert("Error accessing devices. Please ensure camera/mic permissions are granted.");
+      if (err.name === 'NotAllowedError') {
+          alert("Permission denied. Please check Camera/Microphone permissions.");
+      } else {
+          alert(`Error accessing devices: ${err.message || 'Unknown error'}.`);
+      }
     }
   };
 
@@ -712,7 +733,6 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
         if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'paused') {
             mediaRecorderRef.current.resume();
         }
-        // Reset idle on resume
         lastActivityRef.current = Date.now();
         setIsIdle(false);
         startAnalysisLoop();
@@ -734,10 +754,6 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
     
     stopLoops();
 
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      mediaRecorderRef.current.stop();
-    }
-
     if (timerRef.current) {
         clearInterval(timerRef.current);
         timerRef.current = null;
@@ -746,27 +762,56 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
         clearInterval(analysisIntervalRef.current);
         analysisIntervalRef.current = null;
     }
+    
+    // Stop Recorder and handle data in onstop event to avoid race condition
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.onstop = async () => {
+          let videoBlobUrl: string | undefined = undefined;
+          const finalChunks = chunksRef.current;
+          
+          if (finalChunks.length > 0) {
+              const blob = new Blob(finalChunks, { type: 'video/webm' });
+              videoBlobUrl = URL.createObjectURL(blob);
+              // Save complete video to DB for persistence
+              await saveVideoToDB(activeSessionId, blob);
+          }
+          
+          // Clean up storage
+          await clearRecoveryChunks();
+          localStorage.removeItem('sw_session_meta');
+          
+          // Pass correct sessionId to App to maintain consistency
+          onSessionComplete(activeSessionId, elapsedTime, logs, videoBlobUrl);
+          
+          // Save final state with full logs to IDB
+          if (logs.length > 0) {
+              saveLogsToDB(activeSessionId, logs);
+          }
 
-    let videoBlobUrl: string | undefined = undefined;
-    if (chunksRef.current.length > 0) {
-        const blob = new Blob(chunksRef.current, { type: 'video/webm' });
-        videoBlobUrl = URL.createObjectURL(blob);
+          setElapsedTime(0);
+          setLogs([]);
+          setCurrentAnalysis(null);
+          chunksRef.current = [];
+      };
+      
+      mediaRecorderRef.current.stop();
+    } else {
+       // Fallback if recorder was not active
+        setElapsedTime(0);
+        setLogs([]);
+        setCurrentAnalysis(null);
+        chunksRef.current = [];
+        localStorage.removeItem('sw_session_meta');
     }
 
     setStatus(MonitoringState.IDLE);
     setIsCameraEnabled(true);
-    // Reset idle state
     setIsIdle(false);
-    await clearSessionStorage();
-    onSessionComplete(elapsedTime, logs, videoBlobUrl);
-    setElapsedTime(0);
-    setLogs([]);
-    setCurrentAnalysis(null);
-    chunksRef.current = [];
-  }, [elapsedTime, onSessionComplete, logs]);
+
+  }, [elapsedTime, onSessionComplete, logs, activeSessionId]);
 
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 h-[calc(100vh-10rem)] relative">
+    <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 lg:h-[calc(100vh-10rem)] relative">
       
       {/* Recovery Modal */}
       {showRecovery && (
@@ -796,30 +841,28 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
                  </div>
              ) : (
                  <>
-                    <video ref={videoRef} autoPlay muted className="w-full h-full object-contain" />
+                    <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-contain" />
                     
-                    {/* Camera Feed (PIP) */}
-                    <div className="absolute bottom-4 right-4 w-40 sm:w-48 aspect-video bg-gray-950 rounded-lg overflow-hidden border border-gray-700 shadow-xl z-20 transition-opacity duration-300 group/pip">
+                    {/* Camera Feed (PIP) - Responsive Size */}
+                    <div className="absolute bottom-2 right-2 sm:bottom-4 sm:right-4 w-24 sm:w-40 md:w-48 aspect-video bg-gray-950 rounded-lg overflow-hidden border border-gray-700 shadow-xl z-20 transition-opacity duration-300 group/pip">
                         <video 
                             ref={cameraVideoRef} 
                             autoPlay 
-                            muted 
                             playsInline 
+                            muted 
                             className={`w-full h-full object-cover transition-opacity duration-300 ${isCameraEnabled ? 'opacity-100' : 'opacity-0'}`} 
                         />
-                         {!isCameraEnabled && <div className="absolute inset-0 flex items-center justify-center text-xs text-gray-500">Camera Off</div>}
-                        <div className="absolute bottom-0 left-0 right-0 bg-black/50 text-[10px] text-white px-2 py-0.5 text-center backdrop-blur-sm pointer-events-none">
+                         {!isCameraEnabled && <div className="absolute inset-0 flex items-center justify-center text-[10px] sm:text-xs text-gray-500">Camera Off</div>}
+                        <div className="absolute bottom-0 left-0 right-0 bg-black/50 text-[8px] sm:text-[10px] text-white px-1 sm:px-2 py-0.5 text-center backdrop-blur-sm pointer-events-none">
                            {bgConfig.mode === 'none' ? 'Raw Camera' : 'Virtual BG Active'}
                         </div>
                     </div>
                  </>
              )}
              
-             {/* Hidden Canvas for Screenshots */}
+             {/* Hidden Canvas elements */}
              <canvas ref={canvasRef} className="hidden" />
-             {/* Hidden Canvas for Segmentation Processing */}
              <canvas ref={processedCanvasRef} className="hidden" />
-             {/* Hidden Canvas for Compositing Recording */}
              <canvas ref={compositorCanvasRef} className="hidden" />
 
              {status === MonitoringState.RECORDING && (
@@ -827,7 +870,7 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
                      <div className="bg-black/60 backdrop-blur-md px-3 py-1.5 rounded-lg flex items-center gap-2 border border-white/10">
                         <div className="w-2.5 h-2.5 bg-red-500 rounded-full animate-pulse"></div>
                         <span className="text-red-500 font-mono font-bold text-sm">REC</span>
-                        <span className="text-white font-mono text-sm ml-2">{formatTime(elapsedTime)}</span>
+                        <span className="text-white font-mono text-sm ml-2 hidden sm:inline">{formatTime(elapsedTime)}</span>
                      </div>
                      {isIdle && (
                          <div className="bg-yellow-500/20 backdrop-blur-md px-3 py-1.5 rounded-lg flex items-center gap-2 border border-yellow-500/30">
@@ -837,21 +880,27 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
                  </div>
              )}
           </div>
-          {/* ... Rest of UI ... */}
-          <div className={`absolute bottom-6 left-1/2 -translate-x-1/2 flex gap-4 transition-opacity duration-300 z-30 ${status === MonitoringState.IDLE ? 'opacity-0 group-hover:opacity-100' : 'opacity-100'}`}>
+
+          {/* Controls Bar - Moved outside absolute positioning for mobile to prevent overlap */}
+          <div className={`
+              w-full p-4 flex flex-wrap gap-3 justify-center items-center bg-gray-900/95 border-t border-gray-800 z-30
+              lg:absolute lg:bottom-6 lg:left-1/2 lg:-translate-x-1/2 lg:w-auto lg:bg-transparent lg:border-none lg:p-0 
+              lg:transition-opacity lg:duration-300
+              ${status === MonitoringState.IDLE ? 'lg:opacity-0 lg:group-hover:opacity-100' : 'lg:opacity-100'}
+          `}>
              {status === MonitoringState.IDLE ? (
-                 <button onClick={startMonitoring} className="bg-indigo-600 hover:bg-indigo-500 text-white px-6 py-2.5 rounded-full font-medium shadow-lg shadow-indigo-500/20 flex items-center gap-2 transition-all transform hover:scale-105">
+                 <button onClick={startMonitoring} className="bg-indigo-600 hover:bg-indigo-500 text-white px-6 py-2.5 rounded-full font-medium shadow-lg shadow-indigo-500/20 flex items-center gap-2 transition-all transform hover:scale-105 whitespace-nowrap text-sm sm:text-base">
                      Start Session (8h Limit)
                  </button>
              ) : (
                 <>
                     {status === MonitoringState.RECORDING ? (
-                        <button onClick={pauseMonitoring} className="bg-yellow-600 hover:bg-yellow-500 text-white px-6 py-2.5 rounded-full font-medium">Pause</button>
+                        <button onClick={pauseMonitoring} className="bg-yellow-600 hover:bg-yellow-500 text-white px-4 sm:px-6 py-2 sm:py-2.5 rounded-full font-medium text-sm sm:text-base">Pause</button>
                     ) : (
-                        <button onClick={resumeMonitoring} className="bg-green-600 hover:bg-green-500 text-white px-6 py-2.5 rounded-full font-medium">Resume</button>
+                        <button onClick={resumeMonitoring} className="bg-green-600 hover:bg-green-500 text-white px-4 sm:px-6 py-2 sm:py-2.5 rounded-full font-medium text-sm sm:text-base">Resume</button>
                     )}
-                    <button onClick={stopMonitoring} className="bg-red-600 hover:bg-red-500 text-white px-6 py-2.5 rounded-full font-medium">End Session</button>
-                    <button onClick={toggleCamera} className="bg-gray-700 hover:bg-gray-600 text-white px-4 py-2.5 rounded-full font-medium text-sm">
+                    <button onClick={stopMonitoring} className="bg-red-600 hover:bg-red-500 text-white px-4 sm:px-6 py-2 sm:py-2.5 rounded-full font-medium text-sm sm:text-base">End</button>
+                    <button onClick={toggleCamera} className="bg-gray-700 hover:bg-gray-600 text-white px-3 sm:px-4 py-2 sm:py-2.5 rounded-full font-medium text-xs sm:text-sm whitespace-nowrap">
                         {isCameraEnabled ? 'Hide Cam' : 'Show Cam'}
                     </button>
                     
@@ -859,7 +908,7 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
                     <div className="relative">
                         <button 
                             onClick={() => setShowBgSettings(!showBgSettings)} 
-                            className={`bg-gray-800 hover:bg-gray-700 text-white px-3 py-2.5 rounded-full font-medium text-sm border border-gray-600 ${showBgSettings ? 'ring-2 ring-indigo-500' : ''}`}
+                            className={`bg-gray-800 hover:bg-gray-700 text-white px-3 py-2 sm:py-2.5 rounded-full font-medium text-sm border border-gray-600 ${showBgSettings ? 'ring-2 ring-indigo-500' : ''}`}
                             title="Camera Settings"
                         >
                             <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -982,8 +1031,8 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({ username, onSessionCom
         </div>
       </div>
 
-      {/* Right Col: Activity Log */}
-      <div className="bg-gray-900 border border-gray-800 rounded-2xl flex flex-col overflow-hidden shadow-xl">
+      {/* Right Col: Activity Log (Scrollable) */}
+      <div className="bg-gray-900 border border-gray-800 rounded-2xl flex flex-col overflow-hidden shadow-xl lg:h-auto h-96">
         <div className="p-4 border-b border-gray-800 bg-gray-900/95 backdrop-blur z-10">
             <h3 className="text-white font-semibold">Compliance Log</h3>
         </div>
