@@ -1,0 +1,9 @@
+{
+  "name": "Anji Consulting Resource Remote Work Monitor",
+  "description": "Enterprise-grade employee resource monitoring with AI-driven compliance analysis for Anji Consulting Resource Remote Work Monitor",
+  "requestFramePermissions": [
+    "microphone",
+    "camera",
+    "display-capture"
+  ]
+}
