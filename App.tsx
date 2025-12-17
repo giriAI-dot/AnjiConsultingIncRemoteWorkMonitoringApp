@@ -5,6 +5,17 @@ import { Vault } from './components/Vault';
 import { Login } from './components/Login';
 import { RecordedSession, SessionLog, ResourceUser } from './types';
 
+// Robust UUID generator for non-secure contexts (http/lan)
+const generateUUID = () => {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+    var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+};
+
 const App: React.FC = () => {
   // Auth State
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -56,10 +67,26 @@ const App: React.FC = () => {
     localStorage.setItem('sw_sessions', JSON.stringify(sessionsToSave));
   }, [sessions]);
 
-  const handleLogin = (role: 'resource' | 'admin', name: string) => {
+  const handleLogin = (role: 'resource' | 'admin', name: string, password?: string) => {
     setIsAuthenticated(true);
     setUserRole(role);
     setUsername(name);
+
+    // GLOBAL ACCESS: Auto-register new user if they don't exist in local storage.
+    // This allows employees in different locations (e.g. India) to login without
+    // manual pre-configuration on that specific device.
+    if (role === 'resource') {
+        const exists = resourceUsers.find(u => u.username === name);
+        if (!exists) {
+            const newUser: ResourceUser = {
+                id: generateUUID(),
+                username: name,
+                password: password || 'default-secure', // Use provided password or fallback
+                createdAt: Date.now()
+            };
+            setResourceUsers(prev => [...prev, newUser]);
+        }
+    }
   };
 
   const handleLogout = () => {
@@ -69,7 +96,7 @@ const App: React.FC = () => {
   };
 
   const handleCreateUser = (newUser: ResourceUser) => {
-    const userWithId = { ...newUser, id: crypto.randomUUID() };
+    const userWithId = { ...newUser, id: generateUUID() };
     setResourceUsers(prev => [...prev, userWithId]);
   };
 

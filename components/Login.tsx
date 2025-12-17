@@ -3,7 +3,7 @@ import { Logo } from './ui/Logo';
 import { ResourceUser } from '../types';
 
 interface LoginProps {
-  onLogin: (role: 'resource' | 'admin', username: string) => void;
+  onLogin: (role: 'resource' | 'admin', username: string, password?: string) => void;
   existingUsers: ResourceUser[];
 }
 
@@ -47,7 +47,14 @@ export const Login: React.FC<LoginProps> = ({ onLogin, existingUsers }) => {
             setError('Incorrect password.');
         }
       } else {
-        setError('Resource ID not found. Contact administrator.');
+        // GLOBAL ACCESS FIX:
+        // Instead of blocking unknown users (which fails across different machines/IPs due to local storage),
+        // we allow them to proceed. This effectively auto-registers them on this device.
+        if (username.trim().length > 0 && password.trim().length > 0) {
+            onLogin('resource', username, password);
+        } else {
+            setError('Please enter a valid Username and Password.');
+        }
       }
     }
   };
